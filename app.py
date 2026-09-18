@@ -354,7 +354,9 @@ def process_btc() -> None:
             # Highest $5 step at or below pullback: 5, 10, 15, ...
             pb_step = PULLBACK_STEP * int(pullback // PULLBACK_STEP)
             if _btc_pullback_step is None or pb_step > _btc_pullback_step:
-                pb_msg = f"⚠️ BTC pullback ${int(pb_step)} · {price:.0f}"
+                # Lower EMA = "safe" reference: green→EMA9, red→EMA3
+                lower_ema = ema9 if direction > 0 else ema3
+                pb_msg = f"⚠️ BTC pullback ${int(pb_step)} · {lower_ema:.0f}"
                 if not paused:
                     send_telegram(pb_msg)
                 else:
