@@ -39,7 +39,8 @@ YAHOO_SPY_URL = (
 GAP_START = 20.0  # first alert at |gap| >= $20
 GAP_STEP = 5.0  # then every +$5
 
-SPY_NOISE_PCT = 0.05  # first alert only when |vs window open| >= 0.05%
+SPY_FIRST_PCT = 0.03  # first alert when |% vs window open| >= 0.03%
+SPY_STEP_PCT = 0.01  # then every 0.01% step of signed %
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -75,11 +76,11 @@ _state: dict = {
     "spy": {
         "price": None,
         "vwap": None,
-        "side": None,  # "above" / "below" / None
+        "side": None,  # "above" / "below" / None (status only)
         "window": None,  # "morning" / "afternoon" / None
         "window_open": None,
         "pct_vs_open": None,
-        "noise_cleared": False,
+        "last_step": None,  # last fired 0.01% step (signed)
         "last_alert_msg": None,
         "last_alert_at": None,
     },
@@ -495,8 +496,7 @@ def process_btc() -> None:
 # SPY: Yahoo 1m + RTH VWAP, session windows only
 # ---------------------------------------------------------------------------
 
-_spy_noise_cleared: bool = False
-_spy_last_side: str | None = None  # "above" / "below"
+_spy_last_step: float | None = None  # last fired rounded 0.01% step (signed)
 _spy_active_window: str | None = None  # "morning" / "afternoon"
 
 
@@ -598,8 +598,21 @@ def _rth_vwap_and_window_open(
     return vwap, window_open, last_close
 
 
+def _spy_pct_step(pct: float) -> float:
+    """Round signed % to nearest 0.01 step (avoids float spam on same step)."""
+    return round(pct / SPY_STEP_PCT) * SPY_STEP_PCT
+
+
+def _reset_spy_step_state(reason: str) -> None:
+    global _spy_last_step
+    log.info("%s; reset SPY step state", reason)
+    _spy_last_step = None
+    with _state_lock:
+        _state["spy"]["last_step"] = None
+
+
 def process_spy() -> None:
-    global _spy_noise_cleared, _spy_last_side, _spy_active_window
+    global _spy_last_step, _spy_active_window
 
     now = _now_et()
     window = _in_spy_window(now)
@@ -610,29 +623,24 @@ def process_spy() -> None:
     if window is None:
         # Outside windows: clear session alert state so next window starts fresh
         if _spy_active_window is not None:
-            log.info("Left SPY window %s; reset side/noise", _spy_active_window)
+            _reset_spy_step_state(f"Left SPY window {_spy_active_window}")
         _spy_active_window = None
-        _spy_noise_cleared = False
-        _spy_last_side = None
         with _state_lock:
-            _state["spy"]["noise_cleared"] = False
             _state["spy"]["side"] = None
             _state["spy"]["pct_vs_open"] = None
         return
 
-    # New window entered → reset noise/side
+    # New window entered → reset step state
     if _spy_active_window != window:
-        log.info("Entered SPY window %s", window)
+        _reset_spy_step_state(f"Entered SPY window {window}")
         _spy_active_window = window
-        _spy_noise_cleared = False
-        _spy_last_side = None
 
     bars = fetch_spy_bars()
     if not bars:
         raise RuntimeError("empty Yahoo SPY bars")
 
     vwap, window_open, price = _rth_vwap_and_window_open(bars, window)
-    if price is None or window_open is None or vwap is None:
+    if price is None or window_open is None:
         with _state_lock:
             _state["spy"]["price"] = price
             _state["spy"]["vwap"] = vwap
@@ -640,7 +648,10 @@ def process_spy() -> None:
         return
 
     pct_vs_open = (price - window_open) / window_open * 100.0
-    side = "above" if price >= vwap else "below"
+    step = _spy_pct_step(pct_vs_open)
+    side = "above" if (vwap is not None and price >= vwap) else (
+        "below" if vwap is not None else None
+    )
 
     with _state_lock:
         _state["spy"]["price"] = price
@@ -648,44 +659,28 @@ def process_spy() -> None:
         _state["spy"]["window_open"] = window_open
         _state["spy"]["pct_vs_open"] = pct_vs_open
         _state["spy"]["side"] = side
-        _state["spy"]["noise_cleared"] = _spy_noise_cleared
+        _state["spy"]["last_step"] = _spy_last_step
 
-    # Noise filter: first alert only when |vs window open| >= 0.05%
-    if not _spy_noise_cleared:
-        if abs(pct_vs_open) < SPY_NOISE_PCT:
+    # First alert when |%| reaches >= 0.03%; then on every new 0.01% step
+    if _spy_last_step is None:
+        if abs(pct_vs_open) < SPY_FIRST_PCT:
             return
-        _spy_noise_cleared = True
-        with _state_lock:
-            _state["spy"]["noise_cleared"] = True
-        # Fire initial side alert
-        emoji = "🟢" if pct_vs_open >= 0 else "🔴"
-        sign = "+" if pct_vs_open >= 0 else ""
-        msg = f"{emoji} SP {sign}{pct_vs_open:.2f}%"
-        if not _alerts_are_paused():
-            send_telegram(msg)
-        else:
-            log.info("Paused; skip Telegram: %s", msg)
-        _spy_last_side = side
-        with _state_lock:
-            _state["spy"]["last_alert_msg"] = msg
-            _state["spy"]["last_alert_at"] = _iso(_now_et())
+    elif step == _spy_last_step:
         return
 
-    # After noise cleared: alert only on side change vs VWAP
-    if _spy_last_side is not None and side != _spy_last_side:
-        emoji = "🟢" if pct_vs_open >= 0 else "🔴"
-        sign = "+" if pct_vs_open >= 0 else ""
-        msg = f"{emoji} SP {sign}{pct_vs_open:.2f}%"
-        if not _alerts_are_paused():
-            send_telegram(msg)
-        else:
-            log.info("Paused; skip Telegram: %s", msg)
-        _spy_last_side = side
-        with _state_lock:
-            _state["spy"]["last_alert_msg"] = msg
-            _state["spy"]["last_alert_at"] = _iso(_now_et())
-    elif _spy_last_side is None:
-        _spy_last_side = side
+    emoji = "🟢" if pct_vs_open >= 0 else "🔴"
+    sign = "+" if pct_vs_open >= 0 else ""
+    msg = f"{emoji} SP {sign}{pct_vs_open:.2f}%"
+    if not _alerts_are_paused():
+        send_telegram(msg)
+    else:
+        log.info("Paused; skip Telegram: %s", msg)
+
+    _spy_last_step = step
+    with _state_lock:
+        _state["spy"]["last_step"] = step
+        _state["spy"]["last_alert_msg"] = msg
+        _state["spy"]["last_alert_at"] = _iso(_now_et())
 
 
 # ---------------------------------------------------------------------------
@@ -855,7 +850,7 @@ def status_page() -> Response:
     </div>
 
     <div class="card">
-      <strong>SPY VWAP (weekdays 09:30–10:00 &amp; 15:30–16:00 ET)</strong>
+      <strong>SPY % vs window open (weekdays 09:30–10:00 &amp; 15:30–16:00 ET)</strong>
       <table>
         <tr><td>Active window</td><td class="{"ok" if window else "warn"}">{window or "outside — no SPY alerts"}</td></tr>
         <tr><td>Price</td><td>{_fmt(p.get("price"), 4)}</td></tr>
@@ -863,7 +858,7 @@ def status_page() -> Response:
         <tr><td>Side vs VWAP</td><td>{p.get("side") or "—"}</td></tr>
         <tr><td>Window open</td><td>{_fmt(p.get("window_open"), 4)}</td></tr>
         <tr><td>% vs window open</td><td>{_fmt(p.get("pct_vs_open"), 4)}%</td></tr>
-        <tr><td>Noise cleared (≥0.05%)</td><td>{"yes" if p.get("noise_cleared") else "no"}</td></tr>
+        <tr><td>Last % step</td><td>{_fmt(p.get("last_step"), 2)}%</td></tr>
         <tr><td>Last alert</td><td>{p.get("last_alert_msg") or "—"}</td></tr>
         <tr><td>Last alert at</td><td>{p.get("last_alert_at") or "—"}</td></tr>
       </table>
