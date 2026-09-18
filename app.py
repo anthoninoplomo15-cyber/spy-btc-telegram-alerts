@@ -16,7 +16,7 @@ import urllib.request
 from datetime import datetime, time as dtime, timezone
 from zoneinfo import ZoneInfo
 
-from flask import Flask, Response
+from flask import Flask, Response, jsonify, request
 
 # ---------------------------------------------------------------------------
 # Config
@@ -86,6 +86,13 @@ _state: dict = {
     "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
     "telegram_ok": None,
     "telegram_last_error": None,
+    "alerts_paused": False,
+    "btc_pullback": {
+        "extreme": None,
+        "last_step": None,
+        "last_alert_msg": None,
+        "last_alert_at": None,
+    },
 }
 
 
@@ -182,6 +189,14 @@ def _ema_series(closes: list[float], period: int) -> list[float | None]:
 _btc_alert_dir: int | None = None  # +1 bullish gap, -1 bearish
 _btc_alert_step: float | None = None  # last |gap| threshold fired (20, 25, ...)
 
+# Pullback tracking (armed after a gap alert on a side)
+PULLBACK_STEP = 5.0
+_btc_pullback_extreme: float | None = None  # high (bull) / low (bear) since armed
+_btc_pullback_step: float | None = None  # last $5 pullback step fired (5, 10, ...)
+
+# Global pause: skip Telegram sends; keep polling/state updates
+_alerts_paused = False
+
 
 def fetch_btc_closes() -> tuple[list[float], float]:
     """Return (closes, last_close) from Binance 1m klines (with URL fallbacks)."""
@@ -210,8 +225,23 @@ def btc_gap_step(abs_gap: float) -> float | None:
     return GAP_START + n * GAP_STEP
 
 
+def _reset_btc_pullback() -> None:
+    global _btc_pullback_extreme, _btc_pullback_step
+    _btc_pullback_extreme = None
+    _btc_pullback_step = None
+    with _state_lock:
+        _state["btc_pullback"]["extreme"] = None
+        _state["btc_pullback"]["last_step"] = None
+
+
+def _alerts_are_paused() -> bool:
+    with _state_lock:
+        return bool(_state.get("alerts_paused"))
+
+
 def process_btc() -> None:
     global _btc_alert_dir, _btc_alert_step
+    global _btc_pullback_extreme, _btc_pullback_step
 
     closes, price = fetch_btc_closes()
     ema3s = _ema_series(closes, 3)
@@ -241,42 +271,100 @@ def process_btc() -> None:
     if direction == 0:
         return
 
-    # Direction flip → reset and require $20 on new side
+    # Direction flip → reset gap + pullback; require $20 on new side
     if _btc_alert_dir is not None and direction != _btc_alert_dir:
         log.info("BTC gap direction flip %s -> %s; reset", _btc_alert_dir, direction)
         _btc_alert_dir = None
         _btc_alert_step = None
+        _reset_btc_pullback()
 
     step = btc_gap_step(abs_gap)
-    if step is None:
-        return
+    paused = _alerts_are_paused()
 
-    # Fire when we reach a new higher step in current direction
-    should_fire = False
-    if _btc_alert_dir is None:
-        # First alert on this side at whatever step we've reached (at least 20)
-        should_fire = True
-    elif step > (_btc_alert_step or 0):
-        should_fire = True
+    # Re-arm pullback extreme if gap side still active (e.g. after STOP cleared it)
+    if (
+        not paused
+        and _btc_alert_dir is not None
+        and _btc_alert_dir == direction
+        and _btc_pullback_extreme is None
+    ):
+        _btc_pullback_extreme = price
+        _btc_pullback_step = None
+        with _state_lock:
+            _state["btc_pullback"]["extreme"] = _btc_pullback_extreme
+            _state["btc_pullback"]["last_step"] = None
 
-    if not should_fire:
-        return
+    # --- Gap step alerts (existing $20 / +$5 logic) ---
+    if step is not None:
+        should_fire = False
+        if _btc_alert_dir is None:
+            should_fire = True
+        elif step > (_btc_alert_step or 0):
+            should_fire = True
 
-    emoji = "🟢" if direction > 0 else "🔴"
-    # Format: 🟢 BTC GAP $20  /  🔴 BTC GAP $20  (+ optional pct)
-    msg = f"{emoji} BTC GAP ${int(step)}"
-    if gap_pct is not None:
-        msg += f" ({gap_pct:.2f}%)"
+        if should_fire:
+            emoji = "🟢" if direction > 0 else "🔴"
+            # Lower EMA: green (gap>0) → EMA9; red (gap<0) → EMA3
+            lower_ema = ema9 if direction > 0 else ema3
+            msg = f"{emoji} BTC GAP ${int(step)} · {int(round(lower_ema))}"
 
-    send_telegram(msg)
-    _btc_alert_dir = direction
-    _btc_alert_step = step
+            if not paused:
+                send_telegram(msg)
+            else:
+                log.info("Paused; skip Telegram: %s", msg)
 
-    with _state_lock:
-        _state["btc"]["last_alert_step"] = step
-        _state["btc"]["last_alert_dir"] = direction
-        _state["btc"]["last_alert_msg"] = msg
-        _state["btc"]["last_alert_at"] = _iso(_now_et())
+            _btc_alert_dir = direction
+            _btc_alert_step = step
+            # Arm / re-arm pullback extreme on gap alert
+            if _btc_pullback_extreme is None:
+                _btc_pullback_extreme = price
+                _btc_pullback_step = None
+            else:
+                # Favor the gap: bullish track high, bearish track low
+                if direction > 0:
+                    _btc_pullback_extreme = max(_btc_pullback_extreme, price)
+                else:
+                    _btc_pullback_extreme = min(_btc_pullback_extreme, price)
+
+            with _state_lock:
+                _state["btc"]["last_alert_step"] = step
+                _state["btc"]["last_alert_dir"] = direction
+                _state["btc"]["last_alert_msg"] = msg
+                _state["btc"]["last_alert_at"] = _iso(_now_et())
+                _state["btc_pullback"]["extreme"] = _btc_pullback_extreme
+
+    # --- $5 pullback alerts (only when gap alerts are active on a side) ---
+    if _btc_alert_dir is not None and _btc_alert_dir == direction and _btc_pullback_extreme is not None:
+        if direction > 0:
+            # Bullish: track high; pullback = extreme - price
+            if price > _btc_pullback_extreme:
+                _btc_pullback_extreme = price
+                with _state_lock:
+                    _state["btc_pullback"]["extreme"] = _btc_pullback_extreme
+            pullback = _btc_pullback_extreme - price
+        else:
+            # Bearish: track low; pullback = price - extreme
+            if price < _btc_pullback_extreme:
+                _btc_pullback_extreme = price
+                with _state_lock:
+                    _state["btc_pullback"]["extreme"] = _btc_pullback_extreme
+            pullback = price - _btc_pullback_extreme
+
+        if pullback >= PULLBACK_STEP:
+            # Highest $5 step at or below pullback: 5, 10, 15, ...
+            pb_step = PULLBACK_STEP * int(pullback // PULLBACK_STEP)
+            if _btc_pullback_step is None or pb_step > _btc_pullback_step:
+                pb_msg = f"⚠️ BTC pullback ${int(pb_step)} · {price:.0f}"
+                if not paused:
+                    send_telegram(pb_msg)
+                else:
+                    log.info("Paused; skip Telegram: %s", pb_msg)
+                _btc_pullback_step = pb_step
+                with _state_lock:
+                    _state["btc_pullback"]["last_step"] = pb_step
+                    _state["btc_pullback"]["last_alert_msg"] = pb_msg
+                    _state["btc_pullback"]["last_alert_at"] = _iso(_now_et())
+                    _state["btc_pullback"]["extreme"] = _btc_pullback_extreme
 
 
 # ---------------------------------------------------------------------------
@@ -449,7 +537,10 @@ def process_spy() -> None:
         emoji = "🟢" if pct_vs_open >= 0 else "🔴"
         sign = "+" if pct_vs_open >= 0 else ""
         msg = f"{emoji} SP {sign}{pct_vs_open:.2f}%"
-        send_telegram(msg)
+        if not _alerts_are_paused():
+            send_telegram(msg)
+        else:
+            log.info("Paused; skip Telegram: %s", msg)
         _spy_last_side = side
         with _state_lock:
             _state["spy"]["last_alert_msg"] = msg
@@ -461,7 +552,10 @@ def process_spy() -> None:
         emoji = "🟢" if pct_vs_open >= 0 else "🔴"
         sign = "+" if pct_vs_open >= 0 else ""
         msg = f"{emoji} SP {sign}{pct_vs_open:.2f}%"
-        send_telegram(msg)
+        if not _alerts_are_paused():
+            send_telegram(msg)
+        else:
+            log.info("Paused; skip Telegram: %s", msg)
         _spy_last_side = side
         with _state_lock:
             _state["spy"]["last_alert_msg"] = msg
@@ -543,6 +637,7 @@ def status_page() -> Response:
     window = _in_spy_window(now)
     tg_cfg = s["telegram_configured"]
     tg_ok = s["telegram_ok"]
+    paused = bool(s.get("alerts_paused"))
     tg_label = (
         "configured & OK"
         if tg_cfg and tg_ok
@@ -552,6 +647,9 @@ def status_page() -> Response:
 
     b = s["btc"]
     p = s["spy"]
+    pb = s.get("btc_pullback") or {}
+    alerts_label = "STOPPED" if paused else "ALERTS ON"
+    alerts_class = "bad" if paused else "ok"
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -574,11 +672,33 @@ def status_page() -> Response:
     td {{ padding:0.25rem 0.4rem; vertical-align:top; }}
     td:first-child {{ width:42%; color:#8b949e; }}
     footer {{ margin-top:1.5rem; color:#8b949e; font-size:0.85rem; }}
+    .controls {{ display:flex; flex-wrap:wrap; gap:0.75rem; align-items:center; margin-top:0.75rem; }}
+    .btn {{
+      font: inherit; font-weight:700; font-size:1.1rem; letter-spacing:0.04em;
+      border:none; border-radius:10px; padding:0.85rem 1.4rem; cursor:pointer;
+      color:#fff; min-width:8rem;
+    }}
+    .btn:disabled {{ opacity:0.45; cursor:not-allowed; }}
+    .btn-stop {{ background:#da3633; }}
+    .btn-start {{ background:#238636; }}
+    .alerts-status {{ font-size:1.15rem; font-weight:700; }}
   </style>
 </head>
 <body>
   <h1>📡 spy-btc-telegram-alerts</h1>
   <div class="grid">
+    <div class="card">
+      <strong>Alerts control</strong>
+      <div class="controls">
+        <span id="alertsStatus" class="alerts-status {alerts_class}">{alerts_label}</span>
+        <button type="button" class="btn btn-stop" id="btnStop"
+                {"disabled" if paused else ""} onclick="setAlerts(false)">STOP</button>
+        <button type="button" class="btn btn-start" id="btnStart"
+                {"" if paused else "disabled"} onclick="setAlerts(true)">START</button>
+      </div>
+      <p class="k" style="margin:0.75rem 0 0;">STOP skips Telegram (BTC gap, pullbacks, SPY). Polling &amp; state keep updating.</p>
+    </div>
+
     <div class="card">
       <strong>System</strong>
       <table>
@@ -604,6 +724,9 @@ def status_page() -> Response:
         <tr><td>Last alert dir</td><td>{b.get("last_alert_dir") if b.get("last_alert_dir") is not None else "—"}</td></tr>
         <tr><td>Last alert</td><td>{b.get("last_alert_msg") or "—"}</td></tr>
         <tr><td>Last alert at</td><td>{b.get("last_alert_at") or "—"}</td></tr>
+        <tr><td>Pullback extreme</td><td>{_fmt(pb.get("extreme"), 2)}</td></tr>
+        <tr><td>Last pullback step</td><td>{_fmt(pb.get("last_step"), 0)}</td></tr>
+        <tr><td>Last pullback</td><td>{pb.get("last_alert_msg") or "—"}</td></tr>
       </table>
     </div>
 
@@ -623,10 +746,64 @@ def status_page() -> Response:
     </div>
   </div>
   <footer>Auto-refresh 15s · Binance BTCUSDT 1m · Yahoo SPY 1m · no secrets on this page</footer>
+  <script>
+    async function setAlerts(start) {{
+      const path = start ? "/api/start" : "/api/stop";
+      const btnStop = document.getElementById("btnStop");
+      const btnStart = document.getElementById("btnStart");
+      btnStop.disabled = true;
+      btnStart.disabled = true;
+      try {{
+        const res = await fetch(path, {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: "{{}}"
+        }});
+        const data = await res.json();
+        const paused = !!data.alerts_paused;
+        const el = document.getElementById("alertsStatus");
+        el.textContent = paused ? "STOPPED" : "ALERTS ON";
+        el.className = "alerts-status " + (paused ? "bad" : "ok");
+        btnStop.disabled = paused;
+        btnStart.disabled = !paused;
+      }} catch (e) {{
+        alert("Request failed: " + e);
+        btnStop.disabled = false;
+        btnStart.disabled = false;
+      }}
+    }}
+  </script>
 </body>
 </html>
 """
     return Response(html, mimetype="text/html")
+
+
+def _set_alerts_paused(paused: bool):
+    global _alerts_paused
+    with _state_lock:
+        _alerts_paused = paused
+        _state["alerts_paused"] = paused
+    if paused:
+        # Reset pullback tracking on stop so START does not inherit stale extremes
+        _reset_btc_pullback()
+        log.info("Alerts STOPPED (Telegram sends paused)")
+    else:
+        log.info("Alerts STARTED (Telegram sends enabled)")
+    return {"ok": True, "alerts_paused": paused}
+
+
+@app.post("/api/stop")
+def api_stop():
+    # Accept empty / JSON body
+    _ = request.get_data(cache=False)
+    return jsonify(_set_alerts_paused(True))
+
+
+@app.post("/api/start")
+def api_start():
+    _ = request.get_data(cache=False)
+    return jsonify(_set_alerts_paused(False))
 
 
 @app.get("/health")

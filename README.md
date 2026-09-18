@@ -2,17 +2,24 @@
 
 Render-ready Flask terminal that sends Telegram alerts for:
 
-1. **BTC EMA gap (24/7)** — Binance `BTCUSDT` 1m klines; `gap$ = EMA3 − EMA9`. First alert when `|gap|` crosses **$20**, then every **+$5** step in the same direction. Direction flip resets to $20 on the new side. Format: `🟢 BTC GAP $20` / `🔴 BTC GAP $20` (optional `(0.03%)`).
-2. **SPY VWAP (weekdays only)** — Yahoo SPY 1m, RTH VWAP from 09:30 ET. Alerts **only** in:
+1. **BTC EMA gap (24/7)** — Binance `BTCUSDT` 1m klines; `gap$ = EMA3 − EMA9`. First alert when `|gap|` crosses **$20**, then every **+$5** step in the same direction. Direction flip resets to $20 on the new side. Format includes the **lower EMA** (green → EMA9, red → EMA3), no percentage: `🟢 BTC GAP $25 · 76401` / `🔴 BTC GAP $30 · 76380`.
+2. **BTC $5 pullbacks** — While gap alerts are active on a side, track the extreme BTC price favoring the gap (bullish: high; bearish: low). When price retraces **$5** from that extreme, alert `⚠️ BTC pullback $5 · <price>`; then every additional **+$5**. Resets on direction flip / stop.
+3. **SPY VWAP (weekdays only)** — Yahoo SPY 1m, RTH VWAP from 09:30 ET. Alerts **only** in:
    - **09:30–10:00 ET**
    - **15:30–16:00 ET**  
    Noise filter: first alert when `|SPY vs window open| ≥ 0.05%`. Then alerts only on **side change** vs VWAP. Format: `🟢 SP +0.12%` / `🔴 SP -0.08%`.
+
+**Stop / Start:** status page has big STOP / START buttons. When stopped, Telegram sends (BTC gap, pullbacks, SPY) are skipped; polling and state still update.
 
 No Kalshi / trading code. No secrets in the repo.
 
 ## Status page
 
-`GET /` — last BTC gap, last SPY, active windows, Telegram config OK?
+`GET /` — last BTC gap / pullback, last SPY, active windows, Telegram config OK?, STOP/START controls (`ALERTS ON` / `STOPPED`)
+
+`POST /api/stop` — pause Telegram alerts (JSON body optional)
+
+`POST /api/start` — resume Telegram alerts
 
 `GET /health` — JSON `{ok, telegram_configured}`
 
