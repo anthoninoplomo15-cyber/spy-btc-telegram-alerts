@@ -930,11 +930,17 @@ def health():
     return {"ok": True, "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)}
 
 
-# Start pollers on import (gunicorn workers + flask run) after all defs exist
-start_poller()
+# Do NOT start poller at import: gunicorn forks after import and kills those threads.
+# start_poller() runs from gunicorn.conf.py post_fork, and as a lazy fallback on first request.
+
+
+@app.before_request
+def _ensure_poller():
+    start_poller()
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
+    start_poller()
     # Flask reloader would double-start the thread; disable it
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
