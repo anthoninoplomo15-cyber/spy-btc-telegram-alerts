@@ -157,6 +157,128 @@ def send_telegram(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Telegram bot commands (/stop /pause /start /go /status)
+# ---------------------------------------------------------------------------
+
+TELEGRAM_CMD_INTERVAL_SEC = 3
+_telegram_update_offset: int | None = None
+
+
+def _telegram_chat_allowed(chat_id) -> bool:
+    if not TELEGRAM_CHAT_ID:
+        return False
+    return str(chat_id) == str(TELEGRAM_CHAT_ID)
+
+
+def _parse_bot_command(text: str) -> str | None:
+    """Return normalized command like '/stop' or None."""
+    if not text:
+        return None
+    first = text.strip().split()[0]
+    # /stop@MyBot → /stop
+    cmd = first.split("@", 1)[0].lower()
+    if not cmd.startswith("/"):
+        return None
+    return cmd
+
+
+def _handle_telegram_command(cmd: str) -> None:
+    """Handle a command from the allowed chat; reply via Telegram."""
+    if cmd in ("/stop", "/pause"):
+        _set_alerts_paused(True)
+        send_telegram("⛔ Alertas STOP")
+    elif cmd in ("/start", "/go"):
+        _set_alerts_paused(False)
+        send_telegram("✅ Alertas ON")
+    elif cmd == "/status":
+        with _state_lock:
+            paused = bool(_state.get("alerts_paused"))
+            gap = _state["btc"].get("gap")
+            price = _state["btc"].get("price")
+            last_msg = _state["btc"].get("last_alert_msg")
+        state = "OFF" if paused else "ON"
+        if gap is not None:
+            gap_bit = f"gap ${gap:+.1f}"
+        else:
+            gap_bit = "gap —"
+        price_bit = f" · BTC {_fmt(price, 0)}" if price is not None else ""
+        extra = f" · last: {last_msg}" if last_msg else ""
+        send_telegram(f"{'⛔' if paused else '✅'} Alertas {state} · {gap_bit}{price_bit}{extra}")
+    # ignore unknown commands
+
+
+def poll_telegram_commands() -> None:
+    """Long-poll-free getUpdates; advance offset so messages are not reprocessed."""
+    global _telegram_update_offset
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    params: dict = {"timeout": 0, "limit": 50, "allowed_updates": json.dumps(["message"])}
+    if _telegram_update_offset is not None:
+        params["offset"] = _telegram_update_offset
+
+    api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    url = api + "?" + urllib.parse.urlencode(params)
+    try:
+        raw = _http_get(url, timeout=15.0)
+        data = json.loads(raw.decode())
+    except Exception as e:
+        log.warning("Telegram getUpdates failed: %s", e)
+        return
+
+    if not data.get("ok"):
+        log.warning("Telegram getUpdates not ok: %s", data)
+        return
+
+    for upd in data.get("result") or []:
+        uid = upd.get("update_id")
+        if uid is not None:
+            # Always advance past this update so it is never reprocessed
+            next_off = int(uid) + 1
+            if _telegram_update_offset is None or next_off > _telegram_update_offset:
+                _telegram_update_offset = next_off
+
+        msg = upd.get("message") or upd.get("edited_message")
+        if not msg:
+            continue
+        chat = msg.get("chat") or {}
+        if not _telegram_chat_allowed(chat.get("id")):
+            continue
+        cmd = _parse_bot_command(msg.get("text") or "")
+        if cmd is None:
+            continue
+        try:
+            _handle_telegram_command(cmd)
+        except Exception:
+            log.exception("Telegram command handler failed for %s", cmd)
+
+
+def _telegram_cmd_loop() -> None:
+    log.info("Telegram command poller started (interval=%ss)", TELEGRAM_CMD_INTERVAL_SEC)
+    # Discard backlog on startup so old /stop etc. are not replayed
+    global _telegram_update_offset
+    if TELEGRAM_BOT_TOKEN and _telegram_update_offset is None:
+        try:
+            api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+            url = api + "?" + urllib.parse.urlencode({"timeout": 0, "limit": 1, "offset": -1})
+            raw = _http_get(url, timeout=15.0)
+            data = json.loads(raw.decode())
+            results = (data.get("result") or []) if data.get("ok") else []
+            if results:
+                _telegram_update_offset = int(results[-1]["update_id"]) + 1
+                log.info("Telegram offset primed to %s (skip backlog)", _telegram_update_offset)
+        except Exception as e:
+            log.warning("Telegram offset prime failed: %s", e)
+
+    while True:
+        try:
+            poll_telegram_commands()
+        except Exception:
+            log.exception("Unexpected telegram command poller error")
+        time.sleep(TELEGRAM_CMD_INTERVAL_SEC)
+
+
+# ---------------------------------------------------------------------------
 # EMA helpers (seed with SMA, then EMA)
 # ---------------------------------------------------------------------------
 
@@ -612,10 +734,10 @@ def start_poller() -> None:
             _state["started_at"] = _iso(_now_et())
         t = threading.Thread(target=_poll_loop, name="alert-poller", daemon=True)
         t.start()
-
-
-# Start on import (gunicorn workers + flask run)
-start_poller()
+        tc = threading.Thread(
+            target=_telegram_cmd_loop, name="telegram-commands", daemon=True
+        )
+        tc.start()
 
 
 # ---------------------------------------------------------------------------
@@ -811,6 +933,10 @@ def api_start():
 @app.get("/health")
 def health():
     return {"ok": True, "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)}
+
+
+# Start pollers on import (gunicorn workers + flask run) after all defs exist
+start_poller()
 
 
 if __name__ == "__main__":
